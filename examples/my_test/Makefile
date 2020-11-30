@@ -1,9 +1,14 @@
 CC 		:= gcc
-CFLAGS 		:= -I ~/workspace/gattlib/include/
-LDFLAGS 	:= -lgattlib -L ~/workspace/gattlib/build/bluez -Wl,-rpath ~/workspace/gattlib/build/bluez
+CFLAGS 		:= 
+LDFLAGS 	:= -lgattlib -L ~/workspace/gattlib/build/dbus -Wl,-rpath ~/workspace/gattlib/build/dbus \
+		   -lglib-2.0
 
-INCDIRS 	:= ./
-SRCDIRS 	:= ./
+INCDIRS 	:= 	. \
+			~/workspace/gattlib/include \
+			/usr/include/glib-2.0	\
+			/usr/lib/arm-linux-gnueabihf/glib-2.0/include
+
+SRCDIRS 	:= 	.
 
 CFLAGS 		+= $(patsubst %, -I %, $(INCDIRS))
 SRCS 		:= $(foreach dir, $(SRCDIRS), $(wildcard $(dir)/*.c))
