@@ -25,12 +25,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <glib.h>
-#include <signal.h>
 
-#include "gattlib.h"
 #include "generic.h"
 #include "dealevt.h"
+#include "ble_notify.h"
 
 #define USE_ADAPTER 0
 
@@ -39,11 +37,6 @@
 #define NOTIFY_UUID		"0000B001-FF4D-414E-5349-4f4E5F534552"
 #define WRITE_UUID		"0000B002-FF4D-414E-5349-4f4E5F534552"
 
-
-typedef enum { READ, WRITE} operation_t;
-operation_t g_operation = READ;
-long int value_data;
-pthread_t gthread;
 
 static void usage(char *argv[]) {
 	printf("%s <device_address>\n", argv[0]);
@@ -59,7 +52,15 @@ static generic_t param = {
 					.len = 0, 
 					.buf = {0},
 				  },
+	.notify_head = TAILQ_HEAD_INITIALIZER(param.notify_head),
+	.running = 0,
 };
+
+void on_user_abort(int arg) {
+	extern generic_t param;
+	g_main_loop_quit(param.m_main_loop);
+}
+
 
 static int init(generic_t * para, char * addr){
 	if (gattlib_string_to_uuid(WRITE_UUID, strlen(WRITE_UUID) + 1, &para->write_uuid) < 0) {
@@ -75,12 +76,36 @@ static int init(generic_t * para, char * addr){
 		printf("<%s>: addr is null\n", __FUNCTION__);
 	}
 	strcpy(para->gaddr, addr);
+	
+	select_vender_keyB(para, default_vender);
+
+	pthread_mutex_init(&para->mutex, NULL);
+	pthread_cond_init(&para->notify_cond, NULL);
+		
 	return 0;
 }
 
+int ble_wirte(generic_t * para, message_t * msg){	
+	int ret = 0;
+	if(!para->running){
+		printf("<%s>: para->running is 0.\n", __FUNCTION__);
+		return -1;
+	}
+	ret = gattlib_write_char_by_uuid(para->connection, &para->write_uuid, msg->buf, msg->len);
+	if (ret != GATTLIB_SUCCESS) {
+		char uuid_str[MAX_LEN_UUID_STR + 1];
 
-static void on_user_abort(int arg) {
-	g_main_loop_quit(param.m_main_loop);
+		gattlib_uuid_to_string(&para->write_uuid, uuid_str, sizeof(uuid_str));
+
+		if (ret == GATTLIB_NOT_FOUND) {
+			fprintf(stderr, "Could not find GATT Characteristic with UUID %s. "
+				"You might call the program with '--gatt-discovery'.\n", uuid_str);
+		} else {
+			fprintf(stderr, "Error while writing GATT Characteristic with UUID %s (ret:%d)\n",
+				uuid_str, ret);
+		}
+	}
+	return ret;
 }
 
 static void ble_discovered_device(void *adapter, const char* addr, const char* name, void *user_data) {
@@ -102,34 +127,13 @@ static void ble_discovered_device(void *adapter, const char* addr, const char* n
 	}
 }
 
-void notification_handler(const uuid_t* uuid, const uint8_t* data, size_t data_length, void* user_data) {
-	int i;
-	int ret = 0;
-	generic_t * para = (generic_t *)user_data;
-	/*
 
-	printf("Notification Handler: ");
-	
-	for (i = 0; i < data_length; i++) {
-		printf("%02x ", data[i]);
-	}
-	printf("\n");
-	*/
-
-	ret = notify_data_CP(data, data_length, &para->notify_msg);
-	if(ret == 0){
-		printf("Notification Handler: \n");
-		for(i = 0; i < para->notify_msg.len; i++){
-			printf("%02x ", para->notify_msg.buf[i]);
-		}
-		printf("\n");
-	}
-}
 
 int main(int argc, char *argv[]) {
 	int i, ret;
-	size_t len = 100;
-	
+	message_t * notify_msg;
+	message_t out_msg;
+	int timeout_cnt = 0;
 	
 	gattlib_characteristic_t* characteristics;
 	int characteristics_count;
@@ -161,17 +165,39 @@ int main(int argc, char *argv[]) {
 
 	if(param.gflag == 0){
 		printf("ERROR: Failed to find %s\n", param.gaddr);
-		return -1;
+		goto adapter_close_exit;
 	}
 #endif
 
-	
-	param.connection = gattlib_connect(NULL, param.gaddr, GATTLIB_CONNECTION_OPTIONS_LEGACY_DEFAULT);
-	if (param.connection == NULL) {
-		fprintf(stderr, "Fail to connect to the bluetooth device %s.\n", param.gaddr);
-		return 1;
+	ret = ble_setup(&param);
+	if(ret){
+		goto ble_cleanup_exit;
 	}
-	printf("Connect to the bluetooth device %s successful.\n", param.gaddr);
+	notify_msg = (message_t *)malloc(sizeof(message_t));
+	while(get_data_from_notify_queue(&param, notify_msg)){
+		timeout_cnt++;
+		if(timeout_cnt >= 3){
+			printf("<%s>: get_data_from_notify_queue time out more than %d times.\n", timeout_cnt);
+			free(notify_msg);
+			goto ble_cleanup_exit;
+		}
+		
+	}
+	
+	deal_notify_event(&param, notify_msg, out_msg.buf, &out_msg.len);
+	free(notify_msg);
+
+	ret = ble_wirte(&param, &out_msg);
+	printf("send below data to ble:\n");
+	for(i = 0; i < out_msg.len; i++){
+			printf("%02x ", out_msg.buf[i]);
+	}
+	printf("\n");
+	if(ret){
+		goto ble_cleanup_exit;
+	}
+	
+
 	#if 0
 	ret = gattlib_discover_char(connection, &characteristics, &characteristics_count);
 	if (ret != 0) {
@@ -188,23 +214,7 @@ int main(int argc, char *argv[]) {
 	free(characteristics);
 	#endif
 
-	gattlib_register_notification(param.connection, notification_handler, &param);
-	
-	ret = gattlib_notification_start(param.connection, &param.notify_uuid);
-	if (ret) {
-		fprintf(stderr, "Fail to start notification.\n");
-		goto disconnect_exit;
-	}
 
-	// Catch CTRL-C
-	signal(SIGINT, on_user_abort);
-
-	param.m_main_loop = g_main_loop_new(NULL, 0);
-	g_main_loop_run(param.m_main_loop);
-
-	// In case we quit the main loop, clean the connection
-	gattlib_notification_stop(param.connection, &param.notify_uuid);
-	g_main_loop_unref(param.m_main_loop);
 	
 #if 0
 	if (g_operation == READ) {
@@ -241,25 +251,11 @@ int main(int argc, char *argv[]) {
 	} else 
 
 	{
-		ret = gattlib_write_char_by_uuid(connection, &write_uuid, &value_data, sizeof(value_data));
-		if (ret != GATTLIB_SUCCESS) {
-			char uuid_str[MAX_LEN_UUID_STR + 1];
 
-			gattlib_uuid_to_string(&write_uuid, uuid_str, sizeof(uuid_str));
-
-			if (ret == GATTLIB_NOT_FOUND) {
-				fprintf(stderr, "Could not find GATT Characteristic with UUID %s. "
-					"You might call the program with '--gatt-discovery'.\n", uuid_str);
-			} else {
-				fprintf(stderr, "Error while writing GATT Characteristic with UUID %s (ret:%d)\n",
-					uuid_str, ret);
-			}
-			goto EXIT;
-		}
 	}
 #endif
-disconnect_exit:
-	gattlib_disconnect(param.connection);
+ble_cleanup_exit:	
+	ble_cleanup(&param);
 adapter_close_exit:
 #if USE_ADAPTER
 	gattlib_adapter_close(param.adapter);

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 
 #include "dealevt.h"
+#include "md5.h"
 
 enum fetch_notify_data_stage{
 	HEADER1_STG = 0,
@@ -21,8 +22,21 @@ typedef struct read_notify_flag {
 	unsigned char fetch_stage;
 } read_notify_data_flag_t;
 
+typedef struct vender_key_cb{
+	char * vender_name;
+	char * vender_keyB;
+}vender_key_cb_t;
+
 static uint8_t sequence = 0;
 static int polynomial = 0x0000a001;
+
+static vender_key_cb_t vender_key_cb[] = {
+	{.vender_keyB = "RLkqKKM9Vx", .vender_name = "default vender",},
+	{.vender_keyB = "yCvEj4QSfq", .vender_name = "BCL",},
+	{.vender_keyB = "RDqMvyjw7W", .vender_name = "BitKey",},
+	{.vender_keyB = "B6rP75IKVx", .vender_name = "ATsuMi",},
+	{.vender_keyB = "cMz1bLEti3", .vender_name = "RobotHome",},
+};
 
 
 static read_notify_data_flag_t rnd_flag = {
@@ -30,6 +44,10 @@ static read_notify_data_flag_t rnd_flag = {
 	.exp_count = 0,
 	.fetch_stage = HEADER1_STG,
 };
+
+void select_vender_keyB(generic_t * para, vender_name_t vender_name){
+	para->vender_keyB = vender_key_cb[vender_name].vender_keyB;
+}
 
 int notify_data_CP(const uint8_t* data, size_t data_length, message_t *out_msg){
 
@@ -99,18 +117,39 @@ int notify_data_CP(const uint8_t* data, size_t data_length, message_t *out_msg){
 }
 
 
-int handle_huijing_data(Huijing_zigbee_frame_fuki_t * huijing_pdu)
+int handle_huijing_data(generic_t * para, Huijing_zigbee_frame_fuki_t * huijing_pdu, uint8_t * out, uint16_t * len)
 {
 	int ret = 0;
-
-
 	uint16_t u16NewCmd = BUILD_UINT16(huijing_pdu->body.payload[0], huijing_pdu->body.payload[1]);
+	message_t tmp_msg = {.len = 0, .buf = {0}};
 
 	switch(u16NewCmd)
 	{
-		case 1:
+		case BT_CMD_BUILD_LINK:
 		{
-			printf("-------添加用户RESULT返回------\r\n");
+			printf("-------收到锁发送密钥------\r\n");
+			if(huijing_pdu->body.body_len >= 33){
+				uint16_t vender_id;
+				uint8_t vender_keyAB_CB[26];
+			
+				vender_id = BUILD_UINT16(huijing_pdu->body.payload[2], huijing_pdu->body.payload[3]);
+				select_vender_keyB(para, vender_id);
+				/* 厂商编号也是vender_keyA的一部分 */
+				memcpy(para->vender_keyA, &huijing_pdu->body.payload[2], sizeof(para->vender_keyA));				
+				memcpy(vender_keyAB_CB, para->vender_keyA, sizeof(para->vender_keyA));
+				memcpy(vender_keyAB_CB + sizeof(para->vender_keyA), para->vender_keyB, strlen(para->vender_keyB));
+				md5_hash(vender_keyAB_CB, sizeof(para->vender_keyA) + strlen(para->vender_keyB), para->security_key);
+				u16NewCmd = BT_CMD_BUILD_LINK_BACK;
+				memcpy(tmp_msg.buf, &u16NewCmd, 2);
+				tmp_msg.len += 2;
+				memcpy(tmp_msg.buf + 2, para->security_key, 16);
+				tmp_msg.len += 16;
+				msg_merge_huijing_pdu_format(tmp_msg, out, len, 0);
+			}
+			else{
+				printf("body_len error\n");
+				return -1;
+			}
 			break;
 		}
 		default:
@@ -120,7 +159,7 @@ int handle_huijing_data(Huijing_zigbee_frame_fuki_t * huijing_pdu)
 }
 
 	
-int deal_notify_event(generic_t * para){
+int deal_notify_event(generic_t * para, message_t * msg, uint8_t * out, uint16_t * len){
 	Huijing_zigbee_frame_fuki_t huijing_pdu;
 	int ret = 0;
 
@@ -129,17 +168,15 @@ int deal_notify_event(generic_t * para){
 		return -1;
 	}
 
-	ret = huijing_protocol_check(para->notify_msg.buf, &huijing_pdu);
+	ret = huijing_protocol_check(msg->buf, &huijing_pdu);
 	if(ret)
 	{
 		printf("<%s>: huijing_protocol_check failed.\n", __FUNCTION__);
 		return ret;
 	}
 
-	ret = handle_huijing_data(&huijing_pdu);
-	if(ret){
-		printf("<%s>: handle_huijing_data failed.\n", __FUNCTION__);
-	}
+	handle_huijing_data(para, &huijing_pdu, out, len);
+
 	return 0;	
 }
 
@@ -297,19 +334,25 @@ void printf_huijing_frame(Huijing_zigbee_frame_fuki_t huijing_data)
 		printf("huijing_data.foot :%02x \n",huijing_data.foot);
 }
 
-void msg_merge_huijing_pdu_format(message_t msg, uint8_t *data, uint16_t *len)
+void msg_merge_huijing_pdu_format(message_t msg, uint8_t *data, uint16_t *len, uint8_t encrypt)
 {
 	Huijing_zigbee_frame_fuki_t frame_fuki;
 	frame_fuki.header[0] = 0xFE;
 	frame_fuki.header[1] = 0xFE;
 	frame_fuki.ver[0] = 0x01;
 	frame_fuki.ver[1] = 0x00;
-	frame_fuki.len = sizeof(frame_fuki.body.body_num)+ sizeof(frame_fuki.body.body_encrypt) \
-					+ sizeof(frame_fuki.body.body_len) + msg.len;
+	
 	frame_fuki.body.body_num = sequence++;
-	frame_fuki.body.body_encrypt = 0;
-	frame_fuki.body.body_len = msg.len;
-	memcpy(frame_fuki.body.payload, msg.buf, msg.len);
+	frame_fuki.body.body_encrypt = encrypt;
+	if(encrypt){
+		/* 加密 */
+	}
+	else{
+		frame_fuki.body.body_len = msg.len;
+		memcpy(frame_fuki.body.payload, msg.buf, msg.len);
+	}
+	frame_fuki.len = sizeof(frame_fuki.body.body_num)+ sizeof(frame_fuki.body.body_encrypt) \
+					+ sizeof(frame_fuki.body.body_len) + frame_fuki.body.body_len;
 	frame_fuki.foot = 0x3B;
 	uint16_t crc = xor_crc(frame_fuki);
 	memcpy(frame_fuki.crc, &crc, sizeof(crc));

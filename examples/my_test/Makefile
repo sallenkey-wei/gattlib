@@ -1,7 +1,8 @@
 CC 		:= gcc
 CFLAGS 		:= 
 LDFLAGS 	:= -lgattlib -L ~/workspace/gattlib/build/dbus -Wl,-rpath ~/workspace/gattlib/build/dbus \
-		   -lglib-2.0
+		   -lglib-2.0	\
+		   -lpthread
 
 INCDIRS 	:= 	. \
 			~/workspace/gattlib/include \
